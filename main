@@ -76,7 +76,6 @@ fi
 arch="$(dpkg --print-architecture)"
 codename="$(lsb_release --codename --short)"
 distributor="$(lsb_release --id --short)"
-echo "$codename"
 
 case ${codename} in
   stretch)
@@ -91,7 +90,7 @@ case ${codename} in
     ntp="chrony"
     omvCodename="arrakis"
     phpfpm="phpfpm"
-    version=4
+    version=5
     ;;
   *)
     echo "Unsupported version.  Exiting..."
