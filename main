@@ -76,6 +76,7 @@ fi
 arch="$(dpkg --print-architecture)"
 codename="$(lsb_release --codename --short)"
 distributor="$(lsb_release --id --short)"
+echo "$codename"
 
 case ${codename} in
   stretch)
@@ -86,10 +87,10 @@ case ${codename} in
     version=4
     ;;
   buster|eoan)
-    confCmd="omv-mkconf"
-    ntp="ntp"
+    confCmd="omv-salt deploy run"
+    ntp="chrony"
     omvCodename="arrakis"
-    phpfpm="php-fpm"
+    phpfpm="phpfpm"
     version=4
     ;;
   *)
@@ -175,4 +176,177 @@ if [ "${codename}" = "eoan" ]; then
 fi
 
 # install omv-extras
+echo "Downloading omv-extras.org plugin for openmediavault ${version}.x ..."
+file="openmediavault-omvextrasorg_latest_all${version}.deb"
+
+if [ -f "${file}" ]; then
+  rm ${file}
+fi
+wget --no-check-certificate ${url}/${file}
+if [ -f "${file}" ]; then
+  if ! dpkg --install ${file}; then
+    echo "Installing other dependencies ..."
+    apt-get --yes --fix-broken install
+  fi
+
+  echo "Updating repos ..."
+  apt-get update
+else
+  echo "There was a problem downloading the package."
+fi
+
+# disable armbian log services if found
+for service in log2ram armbian-ramlog; do
+  if systemctl list-units --full -all | grep ${service}; then
+    systemctl stop ${service}
+    systemctl disable ${service}
+    rm -f /etc/cron.daily/${service}*
+  fi
+done
+
+# install flashmemory plugin unless disabled
+if [ ${skipFlash} -eq 1 ]; then
+  echo "Skipping installation of the flashmemory plugin."
+else
+  echo "Install folder2ram..."
+  if apt-get --yes --fix-missing --no-install-recommends install folder2ram; then
+    echo "Installed folder2ram."
+  else
+    echo "Failed to install folder2ram."
+  fi
+  sleep 5
+  echo "Install flashmemory plugin..."
+  if apt-get --yes install openmediavault-flashmemory; then
+    echo "Installed flashmemory plugin."
+  else
+    echo "Failed to install flashmemory plugin."
+  fi
+fi
+
+# change default OMV settings
+xmlstarlet ed -L -u "/config/services/smb/extraoptions" -v "$(echo -e "${smbOptions}")" ${OMV_CONFIG_FILE}
+xmlstarlet ed -L -u "/config/services/ssh/enable" -v "1" ${OMV_CONFIG_FILE}
+xmlstarlet ed -L -u "/config/services/ssh/permitrootlogin" -v "1" ${OMV_CONFIG_FILE}
+xmlstarlet ed -L -u "/config/system/time/ntp/enable" -v "1" ${OMV_CONFIG_FILE}
+xmlstarlet ed -L -u "/config/system/time/timezone" -v "${tz}" ${OMV_CONFIG_FILE}
+xmlstarlet ed -L -u "/config/system/network/dns/hostname" -v "${hostname}" ${OMV_CONFIG_FILE}
+
+# disable monitoring and apply changes
+/usr/sbin/omv-rpc -u admin "perfstats" "set" '{"enable":false}'
+/usr/sbin/omv-rpc -u admin "config" "applyChanges" '{ "modules": ["monit","rrdcached","collectd"],"force": true }'
+
+# set min and max frequency for RPi boards
+if [[ "${distributor}" == "Raspbian" ]]; then
+  MIN_SPEED="$(</sys/devices/system/cpu/cpufreq/policy0/cpuinfo_min_freq)"
+  MAX_SPEED="$(</sys/devices/system/cpu/cpufreq/policy0/cpuinfo_max_freq)"
+  # Determine if RPi4 (for future use)
+  if [[ $(awk '$1 == "Revision" { print $3 }' /proc/cpuinfo) =~ [a-c]03111 ]]; then
+    BOARD="rpi4"
+  fi
+  cat << EOF > ${cpuFreqDef}
+GOVERNOR="ondemand"
+MIN_SPEED="${MIN_SPEED}"
+MAX_SPEED="${MAX_SPEED}"
+EOF
+fi
+
+if [ -f "${cpuFreqDef}" ]; then
+  . ${cpuFreqDef}
+else
+  # set cpufreq settings if no defaults
+  if [ -f "/proc/config.gz" ]; then
+    defaultGov="$(zgrep "${defaultGovSearch}" /proc/config.gz | sed -e "s/${defaultGovSearch}\(.*\)=y/\1/")"
+  elif [ -f "/boot/config-$(uname -r)" ]; then
+    defaultGov="$(grep "${defaultGovSearch}" /boot/config-$(uname -r) | sed -e "s/${defaultGovSearch}\(.*\)=y/\1/")"
+  fi
+  if [ -z "${DEFAULT_GOV}" ]; then
+    defaultGov="ondemand"
+  fi
+  GOVERNOR=${defaultGov,,}
+  MIN_SPEED="0"
+  MAX_SPEED="0"
+fi
+
+# set defaults in /etc/default/openmediavault
+omv_set_default "OMV_CPUFREQUTILS_GOVERNOR" "${GOVERNOR}"
+omv_set_default "OMV_CPUFREQUTILS_MINSPEED" "${MIN_SPEED}"
+omv_set_default "OMV_CPUFREQUTILS_MAXSPEED" "${MAX_SPEED}"
+
+if [ ${version} -gt 4 ]; then
+  # update pillar default list - /srv/pillar/omv/default.sls
+  omv-salt stage run prepare
+fi
+
+# update config files
+for service in nginx ${phpfpm} samba flashmemory ssh ${ntp} timezone monit rrdcached collectd cpufrequtils ; do
+  ${confCmd} ${service}
+done
+
+if [[ "${arch}" == "amd64" ]] || [[ "${arch}" == "i386" ]]; then
+  # skip ionice on x86 boards
+  exit 0
+fi
+
+# Add a cron job to make NAS processes more snappy and silence rsyslog
+cat << EOF > /etc/rsyslog.d/omv-armbian.conf
+:msg, contains, "omv-ionice" ~
+:msg, contains, "action " ~
+:msg, contains, "netsnmp_assert" ~
+:msg, contains, "Failed to initiate sched scan" ~
+EOF
+systemctl restart rsyslog
+
+# add taskset to ionice cronjob for biglittle boards
+case ${BOARD} in
+  odroidxu4|bananapim3|nanopifire3|nanopct3plus|nanopim3)
+    taskset='; taskset -c -p 4-7 ${srv}'
+    ;;
+  *rk3399*|*edge*|nanopct4|nanopim4|nanopineo4|renegade-elite|rockpi-4*|rockpro64)
+    taskset='; taskset -c -p 4-5 ${srv}'
+    ;;
+  odroidn2)
+    taskset='; taskset -c -p 2-5 ${srv}'
+    ;;
+esac
+
+# create ionice script
+cat << EOF > ${ioniceScript}
+#!/bin/sh
+
+for srv in \$(pgrep "ftpd|nfsiod|smbd"); do
+  ionice -c1 -p \${srv} ${taskset};
+done
+EOF
+chmod 755 ${ioniceScript}
+
+# create ionice cronjob
+cat << EOF > ${ioniceCron}
+* * * * * root ${ioniceScript} >/dev/null 2>&1
+EOF
+chmod 600 ${ioniceCron}
+
+# remove networkmanager and dhcpcd5 then configure networkd
+if [ ${version} -gt 4 ]; then
+  nic="eth0"
+  if grep -qw "${nic}" /proc/net/dev; then
+    echo "Removing network-manager and dhcpcd5 ..."
+    apt-get -y --autoremove purge network-manager dhcpcd5
+
+    echo "Enable and start systemd-resolved ..."
+    systemctl enable systemd-resolved
+    systemctl start systemd-resolved
+    rm /etc/resolv.conf
+    ln -s /run/systemd/resolve/resolv.conf /etc/resolv.conf
+
+    echo "Configure ${nic} to use networkd ..."
+    mkdir -p /etc/systemd/network
+    echo -e "[Match]\nName=${nic}\n\n[Network]\nDHCP=yes" > /etc/systemd/network/openmediavault-${nic,,}.network
+
+    echo "Enable networkd ..."
+    systemctl enable systemd-networkd
+
+    echo "It is recommended to reboot and then setup the network adapter in the openmediavault web interface."
+  fi
+fi
+
 exit 0
