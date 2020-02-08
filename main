@@ -175,24 +175,6 @@ if [ "${codename}" = "eoan" ]; then
 fi
 
 # install omv-extras
-echo "Downloading omv-extras.org plugin for openmediavault ${version}.x ..."
-file="openmediavault-omvextrasorg_latest_all${version}.deb"
-
-if [ -f "${file}" ]; then
-  rm ${file}
-fi
-wget --no-check-certificate ${url}/${file}
-if [ -f "${file}" ]; then
-  if ! dpkg --install ${file}; then
-    echo "Installing other dependencies ..."
-    apt-get --yes --fix-broken install
-  fi
-
-  echo "Updating repos ..."
-  apt-get update
-else
-  echo "There was a problem downloading the package."
-fi
 
 # disable armbian log services if found
 for service in log2ram armbian-ramlog; do
